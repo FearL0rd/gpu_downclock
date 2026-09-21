@@ -1,178 +1,417 @@
 #!/bin/bash
-
-# Script to dynamically downclock selected NVIDIA GPUs with per-GPU clock settings
-# Requires: nvidia-smi, root privileges
+# Script to dynamically downclock selected NVIDIA GPUs + set power limits + PowerMizer modes
+# Requires: nvidia-smi, nvidia-settings (optional for PowerMizer), root privileges
+#
+# FIX: Detects per-GPU min/max power limits and min/max supported graphics clocks
+#      for GPU 0 .. GPU (N-1) instead of using hardcoded values that often
+#      fall outside the card's legal range.
 
 # Configuration
-LOW_USAGE_THRESHOLD=10  # % usage below which to downclock
-HIGH_USAGE_THRESHOLD=50  # % usage above which to restore full clock
-CHECK_INTERVAL=10  # Seconds between checks
+LOW_USAGE_THRESHOLD=5   # % usage below which to downclock + lower power
+HIGH_USAGE_THRESHOLD=10  # % usage above which to restore full clock + full power
+CHECK_INTERVAL=10        # Seconds between checks
 
-# Selected GPUs to manage (1=manage, unset=ignore)
-# Example: Manage GPUs 1 and 2, ignore 0 and 3
-SELECTED_GPUS[1]=1
-SELECTED_GPUS[2]=1
-# SELECTED_GPUS[0]=1  # Uncomment to include GPU 0
-# SELECTED_GPUS[3]=1  # Uncomment to include GPU 3
+# Optional: leave empty to manage ALL detected GPUs.
+# Example to manage only 0 and 2: SELECTED_GPUS=(0 2)
+SELECTED_GPUS=()
 
-# Per-GPU clock settings (adjust based on nvidia-smi -q -d SUPPORTED_CLOCKS)
-# Only set for GPUs in SELECTED_GPUS
-LOW_CLOCKS[1]=544   # GPU 1 low clock
-HIGH_CLOCKS[1]=1328 # GPU 1 high clock
-LOW_CLOCKS[2]=135   # GPU 2 low clock
-HIGH_CLOCKS[2]=1380 # GPU 2 high clock
-# LOW_CLOCKS[0]=405   # GPU 0 low clock (uncomment if GPU 0 is selected)
-# HIGH_CLOCKS[0]=1200 # GPU 0 high clock (uncomment if GPU 0 is selected)
-# LOW_CLOCKS[3]=480   # GPU 3 low clock (uncomment if GPU 3 is selected)
-# HIGH_CLOCKS[3]=1320 # GPU 3 high clock (uncomment if GPU 3 is selected)
+# Optional overrides (leave empty to auto-detect).
+# If set, values are still clamped into the GPU's legal [min, max] range.
+declare -A OVERRIDE_LOW_CLOCK OVERRIDE_HIGH_CLOCK
+declare -A OVERRIDE_LOW_POWER OVERRIDE_HIGH_POWER
 
-# Ensure nvidia-smi is installed
+# Safety: when auto-picking LOW_POWER, stay this many watts above the hardware min
+# so the card can still idle stably. Set to 0 to use the exact min.
+LOW_POWER_MARGIN_W=0
+
+# === Safety checks ===
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: This script must be run with root privileges (sudo ./script.sh)"
+    exit 1
+fi
 if ! command -v nvidia-smi &> /dev/null; then
     echo "Error: nvidia-smi not found. Please install NVIDIA drivers."
     exit 1
 fi
+HAS_NVIDIA_SETTINGS=0
+if command -v nvidia-settings &> /dev/null; then
+    HAS_NVIDIA_SETTINGS=1
+else
+    echo "Warning: nvidia-settings not found. PowerMizer mode changes will be skipped."
+fi
 
-# Enable persistence mode for all GPUs
+# Enable persistence mode (quiet)
 echo "Enabling persistence mode for all GPUs..."
-sudo nvidia-smi -pm 1
+nvidia-smi -pm 1 >/dev/null 2>&1
 if [ $? -ne 0 ]; then
     echo "Failed to enable persistence mode"
     exit 1
 fi
 
-# Function to get the number of GPUs
-get_gpu_count() {
-    local count=$(nvidia-smi --query-gpu=count --format=csv,noheader | awk '{print $1}')
-    echo $count
+strip_num() {
+    echo "$1" | tr -d '[:space:]' | grep -oE '[0-9]+(\.[0-9]+)?' | head -n1
 }
 
-# Function to get GPU usage for a specific GPU
+get_gpu_count() {
+    local n
+    n=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -dc '0-9')
+    if [ -z "$n" ]; then
+        n=$(nvidia-smi -L 2>/dev/null | wc -l)
+    fi
+    echo "${n:-0}"
+}
+
 get_gpu_usage() {
     local gpu_index=$1
-    local raw_usage=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader -i $gpu_index)
-    echo "GPU $gpu_index: Raw usage output: '$raw_usage'" >&2  # Debug log
-    local usage=$(echo "$raw_usage" | cut -d' ' -f1 | tr -d '%')
-    # Validate usage is a number
-    if [[ "$usage" =~ ^[0-9]+$ ]]; then
-        echo $usage
+    local raw_usage
+    raw_usage=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i "$gpu_index" 2>/dev/null)
+    local usage
+    usage=$(strip_num "$raw_usage")
+    if [[ "$usage" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "${usage%%.*}"
     else
-        echo "GPU $gpu_index: Invalid usage data: '$usage'" >&2
-        echo "-1"  # Return -1 for invalid usage
+        echo "GPU $gpu_index: Invalid usage data: '$raw_usage'" >&2
+        echo "-1"
     fi
 }
 
-# Function to get current clock for a specific GPU
 get_gpu_clock() {
     local gpu_index=$1
-    local clock=$(nvidia-smi --query-gpu=clocks.gr --format=csv,noheader -i $gpu_index | cut -d' ' -f1)
-    if [[ "$clock" =~ ^[0-9]+$ ]]; then
-        echo $clock
+    local raw_clock
+    raw_clock=$(nvidia-smi --query-gpu=clocks.gr --format=csv,noheader,nounits -i "$gpu_index" 2>/dev/null)
+    local clock
+    clock=$(strip_num "$raw_clock")
+    if [[ "$clock" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "${clock%%.*}"
     else
-        echo "GPU $gpu_index: Invalid clock data: '$clock'" >&2
-        echo "-1"  # Return -1 for invalid clock
+        echo "GPU $gpu_index: Invalid clock data: '$raw_clock'" >&2
+        echo "-1"
     fi
 }
 
-# Function to validate clock speed for a GPU
+get_power_limits() {
+    local gpu_index=$1
+    local min_p max_p raw
+    raw=$(nvidia-smi --query-gpu=power.min_limit,power.max_limit --format=csv,noheader,nounits -i "$gpu_index" 2>/dev/null)
+    min_p=$(echo "$raw" | awk -F',' '{print $1}' | tr -d ' ')
+    max_p=$(echo "$raw" | awk -F',' '{print $2}' | tr -d ' ')
+    min_p=$(strip_num "$min_p")
+    max_p=$(strip_num "$max_p")
+
+    if [ -z "$min_p" ] || [ -z "$max_p" ]; then
+        local power_data
+        power_data=$(nvidia-smi -q -d POWER -i "$gpu_index" 2>/dev/null)
+        min_p=$(echo "$power_data" | awk -F: '/Min Power Limit/ {gsub(/[^0-9.]/,"",$2); print $2; exit}')
+        max_p=$(echo "$power_data" | awk -F: '/Max Power Limit/ {gsub(/[^0-9.]/,"",$2); print $2; exit}')
+    fi
+
+    if [ -z "$min_p" ] || [ -z "$max_p" ]; then
+        echo "GPU $gpu_index: Could not parse Min/Max power limits" >&2
+        return 1
+    fi
+    echo "$min_p $max_p"
+}
+
+get_supported_graphics_clocks() {
+    local gpu_index=$1
+    local clocks min_c max_c listed max_query
+
+    listed=$(nvidia-smi --query-supported-clocks=gr --format=csv,noheader,nounits -i "$gpu_index" 2>/dev/null | tr -dc '0-9\n' | grep -E '^[0-9]+$' | sort -n | uniq)
+    if [ -z "$listed" ]; then
+        listed=$(nvidia-smi -q -d SUPPORTED_CLOCKS -i "$gpu_index" 2>/dev/null | \
+                 awk '/Graphics/{flag=1} flag && /[0-9]+ MHz/{print $1} /Memory/{if(flag && seen++) exit}' | \
+                 tr -dc '0-9\n' | grep -E '^[0-9]+$' | sort -n | uniq)
+    fi
+
+    max_query=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader,nounits -i "$gpu_index" 2>/dev/null)
+    max_query=$(strip_num "$max_query")
+
+    if [ -n "$listed" ]; then
+        min_c=$(echo "$listed" | head -n1)
+        max_c=$(echo "$listed" | tail -n1)
+    fi
+
+    if [ -n "$max_query" ]; then
+        if [ -z "$max_c" ] || [ "$(awk "BEGIN{print ($max_query > $max_c) ? 1 : 0}")" -eq 1 ]; then
+            max_c="$max_query"
+        fi
+    fi
+
+    if [ -z "$min_c" ] || [ -z "$max_c" ]; then
+        echo "GPU $gpu_index: Could not determine supported graphics clocks" >&2
+        return 1
+    fi
+    echo "$min_c $max_c"
+}
+
+clock_is_supported() {
+    local gpu_index=$1
+    local clock=$2
+    local listed
+    listed=$(nvidia-smi --query-supported-clocks=gr --format=csv,noheader,nounits -i "$gpu_index" 2>/dev/null | tr -dc '0-9\n')
+    if [ -z "$listed" ]; then
+        listed=$(nvidia-smi -q -d SUPPORTED_CLOCKS -i "$gpu_index" 2>/dev/null | grep -oE '[0-9]+ MHz' | grep -oE '[0-9]+')
+    fi
+    if [ -z "$listed" ]; then
+        return 0
+    fi
+    echo "$listed" | grep -qx "$clock"
+}
+
 validate_clock() {
     local gpu_index=$1
     local clock=$2
-    local supported_clocks=$(nvidia-smi -q -d SUPPORTED_CLOCKS -i $gpu_index | grep "Graphics" | awk '{print $3}' | tr '\n' ' ')
-    if echo "$supported_clocks" | grep -qw "$clock"; then
-        return 0  # Valid clock
-    else
-        echo "GPU $gpu_index: Clock $clock MHz is not supported. Supported clocks: $supported_clocks" >&2
-        return 1  # Invalid clock
+    if ! [[ "$clock" =~ ^[0-9]+$ ]]; then
+        echo "GPU $gpu_index: Clock '$clock' is not a valid integer MHz" >&2
+        return 1
     fi
+    local range
+    range=$(get_supported_graphics_clocks "$gpu_index") || return 1
+    local min_c max_c
+    min_c=$(echo "$range" | awk '{print $1}')
+    max_c=$(echo "$range" | awk '{print $2}')
+    if [ "$clock" -lt "$min_c" ] || [ "$clock" -gt "$max_c" ]; then
+        echo "GPU $gpu_index: Clock $clock MHz outside supported range [$min_c, $max_c]" >&2
+        return 1
+    fi
+    if ! clock_is_supported "$gpu_index" "$clock"; then
+        echo "GPU $gpu_index: Clock $clock MHz is not in the supported-clocks list (range ok: $min_c-$max_c)" >&2
+        return 0
+    fi
+    return 0
 }
 
-# Function to set GPU clock for a specific GPU
+validate_power() {
+    local gpu_index=$1
+    local power=$2
+    if ! [[ "$power" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "GPU $gpu_index: Power limit '$power' is not a valid number" >&2
+        return 1
+    fi
+    local limits min_power max_power
+    limits=$(get_power_limits "$gpu_index") || return 1
+    min_power=$(echo "$limits" | awk '{print $1}')
+    max_power=$(echo "$limits" | awk '{print $2}')
+
+    if (( $(awk "BEGIN {print ($power < $min_power) ? 1 : 0}") )); then
+        echo "GPU $gpu_index: Power $power W is BELOW minimum ($min_power W)" >&2
+        return 1
+    fi
+    if (( $(awk "BEGIN {print ($power > $max_power) ? 1 : 0}") )); then
+        echo "GPU $gpu_index: Power $power W is ABOVE maximum ($max_power W)" >&2
+        return 1
+    fi
+    return 0
+}
+
+clamp() {
+    local val=$1 min=$2 max=$3
+    awk -v v="$val" -v lo="$min" -v hi="$max" 'BEGIN {
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        print v;
+    }'
+}
+
 set_gpu_clock() {
     local gpu_index=$1
     local clock=$2
     echo "GPU $gpu_index: Attempting to lock clock to $clock MHz"
-    if validate_clock $gpu_index $clock; then
-        sudo nvidia-smi -i $gpu_index -lgc $clock
+    if validate_clock "$gpu_index" "$clock"; then
+        nvidia-smi -i "$gpu_index" -lgc "$clock"
         if [ $? -eq 0 ]; then
-            sleep 1  # Wait for change to apply
-            current_clock=$(get_gpu_clock $gpu_index)
-            if [ "$current_clock" -eq "$clock" ]; then
-                echo "GPU $gpu_index: Successfully locked clock to $current_clock MHz"
+            sleep 1
+            local current_clock
+            current_clock=$(get_gpu_clock "$gpu_index")
+            if [ "$current_clock" = "$clock" ]; then
+                echo "GPU $gpu_index: Clock locked to $current_clock MHz"
             else
-                echo "GPU $gpu_index: Failed: Clock is $current_clock MHz, expected $clock MHz"
+                echo "GPU $gpu_index: Clock command accepted (now $current_clock MHz; requested $clock)"
             fi
         else
-            echo "GPU $gpu_index: Failed to execute nvidia-smi -lgc"
+            echo "GPU $gpu_index: Failed to execute -lgc" >&2
         fi
     else
-        echo "GPU $gpu_index: Skipping clock adjustment due to invalid clock speed"
+        echo "GPU $gpu_index: Skipping invalid clock" >&2
     fi
 }
 
-# Function to reset GPU clock to default for a specific GPU
+set_power_limit() {
+    local gpu_index=$1
+    local power=$2
+    echo "GPU $gpu_index: Attempting to set power limit to $power W"
+    if validate_power "$gpu_index" "$power"; then
+        nvidia-smi -i "$gpu_index" --power-limit="$power"
+        if [ $? -eq 0 ]; then
+            echo "GPU $gpu_index: Power limit successfully set to $power W"
+        else
+            echo "GPU $gpu_index: Failed to set power limit" >&2
+        fi
+    else
+        echo "GPU $gpu_index: Skipping invalid power limit" >&2
+    fi
+}
+
+set_powermizer_mode() {
+    local gpu_index=$1
+    local mode=$2
+    if [ "$HAS_NVIDIA_SETTINGS" -ne 1 ]; then
+        return 0
+    fi
+    local mode_name="Adaptive (Level 0-2)"
+    if [ "$mode" -eq 1 ]; then
+        mode_name="Maximum Performance (Level 4)"
+    fi
+    echo "GPU $gpu_index: Attempting to set PowerMizer mode to $mode_name"
+    export DISPLAY="${DISPLAY:-:0}"
+    nvidia-settings -a "[gpu:$gpu_index]/GpuPowerMizerMode=$mode" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo "GPU $gpu_index: PowerMizer mode successfully set to $mode_name"
+    else
+        echo "GPU $gpu_index: Failed to set PowerMizer mode (Is an X server running on DISPLAY=${DISPLAY}?)" >&2
+    fi
+}
+
 reset_gpu_clock() {
     local gpu_index=$1
     echo "GPU $gpu_index: Resetting clock to default..."
-    sudo nvidia-smi -i $gpu_index -rgc
+    nvidia-smi -i "$gpu_index" -rgc
     if [ $? -eq 0 ]; then
-        echo "GPU $gpu_index: Clock reset to default"
+        echo "GPU $gpu_index: Clock reset complete"
     else
-        echo "GPU $gpu_index: Failed to reset clock"
+        echo "GPU $gpu_index: Failed to reset clock" >&2
     fi
 }
 
-# Get the number of GPUs
+reset_power_limit() {
+    local gpu_index=$1
+    echo "GPU $gpu_index: Resetting power limit to maximum..."
+    local limits max_power
+    limits=$(get_power_limits "$gpu_index")
+    max_power=$(echo "$limits" | awk '{print $2}')
+    if [ -n "$max_power" ]; then
+        nvidia-smi -i "$gpu_index" --power-limit="$max_power"
+        if [ $? -eq 0 ]; then
+            echo "GPU $gpu_index: Power limit reset to $max_power W"
+        else
+            echo "GPU $gpu_index: Failed to reset power limit" >&2
+        fi
+    else
+        echo "GPU $gpu_index: Could not determine max power limit - skipping reset" >&2
+    fi
+}
+
+reset_powermizer() {
+    local gpu_index=$1
+    if [ "$HAS_NVIDIA_SETTINGS" -ne 1 ]; then
+        return 0
+    fi
+    echo "GPU $gpu_index: Resetting PowerMizer mode to Adaptive..."
+    export DISPLAY="${DISPLAY:-:0}"
+    nvidia-settings -a "[gpu:$gpu_index]/GpuPowerMizerMode=0" >/dev/null 2>&1
+}
+
 gpu_count=$(get_gpu_count)
 echo "Detected $gpu_count GPU(s)"
-
-# Validate selected GPUs and their clock settings
-selected_count=0
-for gpu_index in "${!SELECTED_GPUS[@]}"; do
-    if [ $gpu_index -ge $gpu_count ]; then
-        echo "Error: GPU $gpu_index is selected but does not exist (only $gpu_count GPUs detected)"
-        exit 1
-    fi
-    if [ -z "${LOW_CLOCKS[$gpu_index]}" ] || [ -z "${HIGH_CLOCKS[$gpu_index]}" ]; then
-        echo "Error: LOW_CLOCK or HIGH_CLOCK not set for selected GPU $gpu_index"
-        exit 1
-    fi
-    validate_clock $gpu_index ${LOW_CLOCKS[$gpu_index]} || exit 1
-    validate_clock $gpu_index ${HIGH_CLOCKS[$gpu_index]} || exit 1
-    ((selected_count++))
-done
-if [ $selected_count -eq 0 ]; then
-    echo "Error: No GPUs selected for management"
+if [ "$gpu_count" -eq 0 ]; then
+    echo "Error: No NVIDIA GPUs found"
     exit 1
 fi
-echo "Managing $selected_count GPU(s): ${!SELECTED_GPUS[@]}"
 
-# Main loop
-echo "Monitoring GPU usage and adjusting clock speeds for selected GPUs..."
-while true; do
-    for gpu_index in "${!SELECTED_GPUS[@]}"; do
-        usage=$(get_gpu_usage $gpu_index)
-        current_clock=$(get_gpu_clock $gpu_index)
-        echo "GPU $gpu_index: Usage: $usage%, Current clock: $current_clock MHz"
+declare -a LOW_CLOCKS HIGH_CLOCKS LOW_POWER HIGH_POWER
+declare -a GPU_MIN_POWER GPU_MAX_POWER GPU_MIN_CLOCK GPU_MAX_CLOCK
 
-        # Skip if usage is invalid
-        if [ "$usage" -eq -1 ]; then
-            echo "GPU $gpu_index: Skipping due to invalid usage data"
-            continue
-        fi
-
-        if [ "$usage" -lt "$LOW_USAGE_THRESHOLD" ]; then
-            echo "GPU $gpu_index: Usage low (<$LOW_USAGE_THRESHOLD%). Downclocking..."
-            set_gpu_clock $gpu_index ${LOW_CLOCKS[$gpu_index]}
-        elif [ "$usage" -gt "$HIGH_USAGE_THRESHOLD" ]; then
-            echo "GPU $gpu_index: Usage high (>$HIGH_USAGE_THRESHOLD%). Restoring full clock..."
-            set_gpu_clock $gpu_index ${HIGH_CLOCKS[$gpu_index]}
-        else
-            echo "GPU $gpu_index: Usage in normal range ($LOW_USAGE_THRESHOLD%-$HIGH_USAGE_THRESHOLD%). No changes."
-        fi
+if [ "${#SELECTED_GPUS[@]}" -eq 0 ]; then
+    for ((i=0; i<gpu_count; i++)); do
+        SELECTED_GPUS+=("$i")
     done
+fi
 
-    sleep $CHECK_INTERVAL
+echo "----- Detected hardware limits -----"
+for gpu_index in "${SELECTED_GPUS[@]}"; do
+    if ! [[ "$gpu_index" =~ ^[0-9]+$ ]] || [ "$gpu_index" -ge "$gpu_count" ]; then
+        echo "Error: GPU $gpu_index selected but only $gpu_count GPUs exist (indices 0..$((gpu_count-1)))"
+        exit 1
+    fi
+
+    name=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$gpu_index" 2>/dev/null)
+    limits=$(get_power_limits "$gpu_index") || exit 1
+    min_p=$(echo "$limits" | awk '{print $1}')
+    max_p=$(echo "$limits" | awk '{print $2}')
+    clocks=$(get_supported_graphics_clocks "$gpu_index") || exit 1
+    min_c=$(echo "$clocks" | awk '{print $1}')
+    max_c=$(echo "$clocks" | awk '{print $2}')
+
+    GPU_MIN_POWER[$gpu_index]=$min_p
+    GPU_MAX_POWER[$gpu_index]=$max_p
+    GPU_MIN_CLOCK[$gpu_index]=$min_c
+    GPU_MAX_CLOCK[$gpu_index]=$max_c
+
+    low_c=${OVERRIDE_LOW_CLOCK[$gpu_index]:-$min_c}
+    high_c=${OVERRIDE_HIGH_CLOCK[$gpu_index]:-$max_c}
+    low_p=${OVERRIDE_LOW_POWER[$gpu_index]:-}
+    high_p=${OVERRIDE_HIGH_POWER[$gpu_index]:-$max_p}
+
+    if [ -z "$low_p" ]; then
+        low_p=$(awk -v min="$min_p" -v m="$LOW_POWER_MARGIN_W" 'BEGIN{v=min+m; print v}')
+    fi
+
+    LOW_CLOCKS[$gpu_index]=$(clamp "$low_c" "$min_c" "$max_c")
+    HIGH_CLOCKS[$gpu_index]=$(clamp "$high_c" "$min_c" "$max_c")
+    LOW_CLOCKS[$gpu_index]=${LOW_CLOCKS[$gpu_index]%%.*}
+    HIGH_CLOCKS[$gpu_index]=${HIGH_CLOCKS[$gpu_index]%%.*}
+
+    LOW_POWER[$gpu_index]=$(clamp "$low_p" "$min_p" "$max_p")
+    HIGH_POWER[$gpu_index]=$(clamp "$high_p" "$min_p" "$max_p")
+
+    echo "GPU $gpu_index ($name)"
+    echo "  Power legal range : ${min_p} W .. ${max_p} W"
+    echo "  Clock legal range : ${min_c} MHz .. ${max_c} MHz"
+    echo "  Using LOW         : ${LOW_CLOCKS[$gpu_index]} MHz / ${LOW_POWER[$gpu_index]} W"
+    echo "  Using HIGH        : ${HIGH_CLOCKS[$gpu_index]} MHz / ${HIGH_POWER[$gpu_index]} W"
+done
+echo "-----------------------------------"
+
+for gpu_index in "${SELECTED_GPUS[@]}"; do
+    validate_clock "$gpu_index" "${LOW_CLOCKS[$gpu_index]}" || exit 1
+    validate_clock "$gpu_index" "${HIGH_CLOCKS[$gpu_index]}" || exit 1
+    validate_power "$gpu_index" "${LOW_POWER[$gpu_index]}" || exit 1
+    validate_power "$gpu_index" "${HIGH_POWER[$gpu_index]}" || exit 1
 done
 
-# Reset selected GPU clocks on script exit (Ctrl+C)
-trap 'for gpu_index in "${!SELECTED_GPUS[@]}"; do reset_gpu_clock $gpu_index; done; exit' SIGINT SIGTERM
+echo "Managing ${#SELECTED_GPUS[@]} GPU(s): ${SELECTED_GPUS[*]}"
+
+trap 'echo "Caught exit signal - resetting clocks, power limits, and PowerMizer modes..."; \
+      for gpu_index in "${SELECTED_GPUS[@]}"; do \
+          reset_gpu_clock "$gpu_index"; \
+          reset_power_limit "$gpu_index"; \
+          reset_powermizer "$gpu_index"; \
+      done; \
+      echo "Cleanup complete."; exit 0' SIGINT SIGTERM
+
+echo "Starting monitoring (downclock + min power + Adaptive when idle, max clock + max power + Max Perf when busy)..."
+while true; do
+    for gpu_index in "${SELECTED_GPUS[@]}"; do
+        usage=$(get_gpu_usage "$gpu_index")
+        current_clock=$(get_gpu_clock "$gpu_index")
+        echo "GPU $gpu_index: Usage: $usage%, Current clock: $current_clock MHz (legal clocks ${GPU_MIN_CLOCK[$gpu_index]}-${GPU_MAX_CLOCK[$gpu_index]} MHz, legal power ${GPU_MIN_POWER[$gpu_index]}-${GPU_MAX_POWER[$gpu_index]} W)"
+        if [ "$usage" -eq -1 ] || [ "$current_clock" -eq -1 ]; then
+            echo "GPU $gpu_index: Skipping due to invalid data"
+            continue
+        fi
+        if [ "$usage" -lt "$LOW_USAGE_THRESHOLD" ]; then
+            echo "GPU $gpu_index: Usage low → min clock + min power + Adaptive Mode"
+            set_gpu_clock "$gpu_index" "${LOW_CLOCKS[$gpu_index]}"
+            set_power_limit "$gpu_index" "${LOW_POWER[$gpu_index]}"
+            set_powermizer_mode "$gpu_index" "0"
+        elif [ "$usage" -gt "$HIGH_USAGE_THRESHOLD" ]; then
+            echo "GPU $gpu_index: Usage high → max clock + max power + Max Perf Mode"
+            set_gpu_clock "$gpu_index" "${HIGH_CLOCKS[$gpu_index]}"
+            set_power_limit "$gpu_index" "${HIGH_POWER[$gpu_index]}"
+            set_powermizer_mode "$gpu_index" "1"
+        else
+            echo "GPU $gpu_index: Usage normal → no change"
+        fi
+    done
+    sleep "$CHECK_INTERVAL"
+done
