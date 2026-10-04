@@ -11,7 +11,7 @@ This script monitors your GPU utilization in real-time. When usage drops, it dyn
 ### Features
 * Dynamically toggles between minimum and maximum supported clocks based on load.
 * Configurable usage thresholds.
-* Configurable `HIGH_CLOCK_OFFSET` to permanently underclock the max performance state.
+* Configurable `HIGH_POWER_OFFSET` to permanently lower the maximum power limit during heavy workloads to reduce temperatures.
 * Auto-detects the legal clock and power limits for each specific GPU.
 
 ## Tested Hardware
