@@ -1,31 +1,24 @@
 #!/bin/bash
-# Script to dynamically downclock selected NVIDIA GPUs + set power limits + PowerMizer modes
+# Script to dynamically adjust clocks and power limits for selected NVIDIA GPUs
 # Requires: nvidia-smi, nvidia-settings (optional for PowerMizer), root privileges
-#
-# FIX: Detects per-GPU min/max power limits and min/max supported graphics clocks
-#      for GPU 0 .. GPU (N-1) instead of using hardcoded values that often
-#      fall outside the card's legal range.
 
 # Configuration
 LOW_USAGE_THRESHOLD=5   # % usage below which to downclock + lower power
 HIGH_USAGE_THRESHOLD=10  # % usage above which to restore full clock + full power
 CHECK_INTERVAL=10        # Seconds between checks
 
-# NEW: Offset to subtract from the maximum supported clock for the HIGH state (in MHz)
-# e.g., set to 100 to underclock the maximum frequency by 100 MHz.
-HIGH_CLOCK_OFFSET=100
+# NEW: Offset to subtract from the maximum supported power limit for the HIGH state (in Watts)
+# e.g., set to 100 to limit the max power by 100 W under heavy load.
+HIGH_POWER_OFFSET=100
 
 # Optional: leave empty to manage ALL detected GPUs.
-# Example to manage only 0 and 2: SELECTED_GPUS=(0 2)
 SELECTED_GPUS=()
 
 # Optional overrides (leave empty to auto-detect).
-# If set, values are still clamped into the GPU's legal [min, max] range.
 declare -A OVERRIDE_LOW_CLOCK OVERRIDE_HIGH_CLOCK
 declare -A OVERRIDE_LOW_POWER OVERRIDE_HIGH_POWER
 
 # Safety: when auto-picking LOW_POWER, stay this many watts above the hardware min
-# so the card can still idle stably. Set to 0 to use the exact min.
 LOW_POWER_MARGIN_W=0
 
 # === Safety checks ===
@@ -351,14 +344,15 @@ for gpu_index in "${SELECTED_GPUS[@]}"; do
     GPU_MIN_CLOCK[$gpu_index]=$min_c
     GPU_MAX_CLOCK[$gpu_index]=$max_c
 
+    # Use max core clocks for HIGH
     low_c=${OVERRIDE_LOW_CLOCK[$gpu_index]:-$min_c}
+    high_c=${OVERRIDE_HIGH_CLOCK[$gpu_index]:-$max_c}
     
-    # NEW: Calculate the underclocked high by subtracting the offset
-    underclocked_max=$(( max_c - HIGH_CLOCK_OFFSET ))
-    high_c=${OVERRIDE_HIGH_CLOCK[$gpu_index]:-$underclocked_max}
+    # NEW: Calculate reduced power target for HIGH
+    underpowered_raw=$(awk -v max="$max_p" -v off="$HIGH_POWER_OFFSET" 'BEGIN{print max - off}')
     
     low_p=${OVERRIDE_LOW_POWER[$gpu_index]:-}
-    high_p=${OVERRIDE_HIGH_POWER[$gpu_index]:-$max_p}
+    high_p=${OVERRIDE_HIGH_POWER[$gpu_index]:-$underpowered_raw}
 
     if [ -z "$low_p" ]; then
         low_p=$(awk -v min="$min_p" -v m="$LOW_POWER_MARGIN_W" 'BEGIN{v=min+m; print v}')
@@ -376,7 +370,7 @@ for gpu_index in "${SELECTED_GPUS[@]}"; do
     echo "  Power legal range : ${min_p} W .. ${max_p} W"
     echo "  Clock legal range : ${min_c} MHz .. ${max_c} MHz"
     echo "  Using LOW         : ${LOW_CLOCKS[$gpu_index]} MHz / ${LOW_POWER[$gpu_index]} W"
-    echo "  Using HIGH        : ${HIGH_CLOCKS[$gpu_index]} MHz (Underclocked by ${HIGH_CLOCK_OFFSET} MHz) / ${HIGH_POWER[$gpu_index]} W"
+    echo "  Using HIGH        : ${HIGH_CLOCKS[$gpu_index]} MHz / ${HIGH_POWER[$gpu_index]} W (Max power offset by -${HIGH_POWER_OFFSET} W)"
 done
 echo "-----------------------------------"
 
@@ -409,14 +403,14 @@ while true; do
         fi
         if [ "$usage" -lt "$LOW_USAGE_THRESHOLD" ]; then
             echo "GPU $gpu_index: Usage low → min clock + min power + Adaptive Mode"
+            set_powermizer_mode "$gpu_index" "0"
             set_gpu_clock "$gpu_index" "${LOW_CLOCKS[$gpu_index]}"
             set_power_limit "$gpu_index" "${LOW_POWER[$gpu_index]}"
-            set_powermizer_mode "$gpu_index" "0"
         elif [ "$usage" -gt "$HIGH_USAGE_THRESHOLD" ]; then
             echo "GPU $gpu_index: Usage high → max clock + max power + Max Perf Mode"
+            set_powermizer_mode "$gpu_index" "1"
             set_gpu_clock "$gpu_index" "${HIGH_CLOCKS[$gpu_index]}"
             set_power_limit "$gpu_index" "${HIGH_POWER[$gpu_index]}"
-            set_powermizer_mode "$gpu_index" "1"
         else
             echo "GPU $gpu_index: Usage normal → no change"
         fi
