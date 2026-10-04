@@ -11,6 +11,10 @@ LOW_USAGE_THRESHOLD=5   # % usage below which to downclock + lower power
 HIGH_USAGE_THRESHOLD=10  # % usage above which to restore full clock + full power
 CHECK_INTERVAL=10        # Seconds between checks
 
+# NEW: Offset to subtract from the maximum supported clock for the HIGH state (in MHz)
+# e.g., set to 100 to underclock the maximum frequency by 100 MHz.
+HIGH_CLOCK_OFFSET=100
+
 # Optional: leave empty to manage ALL detected GPUs.
 # Example to manage only 0 and 2: SELECTED_GPUS=(0 2)
 SELECTED_GPUS=()
@@ -348,7 +352,11 @@ for gpu_index in "${SELECTED_GPUS[@]}"; do
     GPU_MAX_CLOCK[$gpu_index]=$max_c
 
     low_c=${OVERRIDE_LOW_CLOCK[$gpu_index]:-$min_c}
-    high_c=${OVERRIDE_HIGH_CLOCK[$gpu_index]:-$max_c}
+    
+    # NEW: Calculate the underclocked high by subtracting the offset
+    underclocked_max=$(( max_c - HIGH_CLOCK_OFFSET ))
+    high_c=${OVERRIDE_HIGH_CLOCK[$gpu_index]:-$underclocked_max}
+    
     low_p=${OVERRIDE_LOW_POWER[$gpu_index]:-}
     high_p=${OVERRIDE_HIGH_POWER[$gpu_index]:-$max_p}
 
@@ -368,7 +376,7 @@ for gpu_index in "${SELECTED_GPUS[@]}"; do
     echo "  Power legal range : ${min_p} W .. ${max_p} W"
     echo "  Clock legal range : ${min_c} MHz .. ${max_c} MHz"
     echo "  Using LOW         : ${LOW_CLOCKS[$gpu_index]} MHz / ${LOW_POWER[$gpu_index]} W"
-    echo "  Using HIGH        : ${HIGH_CLOCKS[$gpu_index]} MHz / ${HIGH_POWER[$gpu_index]} W"
+    echo "  Using HIGH        : ${HIGH_CLOCKS[$gpu_index]} MHz (Underclocked by ${HIGH_CLOCK_OFFSET} MHz) / ${HIGH_POWER[$gpu_index]} W"
 done
 echo "-----------------------------------"
 
